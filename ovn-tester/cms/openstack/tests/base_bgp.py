@@ -1,0 +1,157 @@
+import logging
+import time
+import ovn_stats
+
+from dataclasses import dataclass
+from typing import List
+
+from ovn_ext_cmd import ExtCmd
+from ovn_context import Context
+from ovn_workload import ChassisNode
+
+from cms.openstack import OpenStackCloud, ExternalNetworkSpec
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class BaseBgpConfig:
+    n_projects: int = 1
+    n_chassis_per_gw_lrp: int = 3
+    n_vms_per_project: int = 10
+    n_routes_per_vrf: int = 100
+    batch_size: int = 0
+
+
+class BaseBgp(ExtCmd):
+    def __init__(self, config, cluster, global_cfg):
+        super().__init__(config, cluster)
+        test_config = config.get("base_bgp")
+        self.config = BaseBgpConfig(**test_config)
+
+    def inject_vrf_routes(self, hosting, nsenter, vrf_dev, nexthop, vrf_id):
+        hosting.run(
+            f"{nsenter} python3 /tmp/ovn_inject_routes.py "
+            f"--vrf-dev {vrf_dev} --nexthop {nexthop} "
+            f"--table {vrf_id} --n-routes {self.config.n_routes_per_vrf} "
+            f"--vrf-id {vrf_id}"
+        )
+
+    def wait_for_learned_routes(self, ovn, expected):
+        while True:
+            learned = ovn.sbctl.learned_routes()
+            log.info(f"Total learned routes {learned} vs expected {expected}")
+            if learned >= expected:
+                return learned
+            time.sleep(0.001)
+
+    @ovn_stats.timeit
+    def run_batch(self, ovn, nsenter, start_idx, end_idx, ext_net):
+        # Create projects and VMs for this batch
+        for _ in range(end_idx - start_idx):
+            ovn.new_project(ext_net=ext_net)
+
+        for project in ovn.projects[start_idx:end_idx]:
+            for index in range(self.config.n_vms_per_project):
+                ovn.add_vm_to_project(project, f"{project.uuid[:6]}-{index}")
+
+        # Enable dynamic routing for this batch
+        for vrf_id, project in enumerate(
+            ovn.projects[start_idx:end_idx], start=start_idx + 1
+        ):
+            ovn.nbctl.lr_set_options(
+                project.router,
+                {
+                    "dynamic-routing": "true",
+                    "dynamic-routing-vrf-id": str(vrf_id),
+                },
+            )
+            if project.gw_port:
+                ovn.nbctl.lr_port_set_options(
+                    project.gw_port,
+                    {
+                        "dynamic-routing-maintain-vrf": "true",
+                    },
+                )
+            log.info(
+                f"Enabled dynamic routing on router "
+                f"{project.router.name} vrf-id={vrf_id}"
+            )
+
+        # Inject routes into VRFs for this batch
+        for vrf_id, project in enumerate(
+            ovn.projects[start_idx:end_idx], start=start_idx + 1
+        ):
+            if not project.gw_port:
+                continue
+
+            vrf_dev = f"ovnvrf{vrf_id}"
+            octet2 = (vrf_id >> 8) & 0xFF
+            octet3 = vrf_id & 0xFF
+            nexthop = f"172.{octet2}.{octet3}.1"
+
+            hosting = None
+            for attempt in range(30):
+                for chassis in ovn.worker_nodes:
+                    try:
+                        chassis.run(
+                            f"{nsenter} test -d /sys/class/net/{vrf_dev}",
+                            raise_on_error=True,
+                        )
+                        hosting = chassis
+                        break
+                    except Exception:
+                        pass
+                if hosting:
+                    break
+                time.sleep(1)
+
+            if not hosting:
+                log.warning(f"{vrf_dev} not found on any chassis")
+                continue
+
+            self.inject_vrf_routes(hosting, nsenter, vrf_dev, nexthop, vrf_id)
+            log.info(
+                f"Injected {self.config.n_routes_per_vrf} routes "
+                f"into {vrf_dev} on {hosting.container}"
+            )
+
+        # Wait for cumulative learned routes
+        expected = end_idx * self.config.n_routes_per_vrf
+        self.wait_for_learned_routes(ovn, expected)
+
+    def run(self, clouds: List[OpenStackCloud], global_cfg):
+        # Phase 1: Standard OpenStack bringup
+        with Context(clouds, "bgp_bringup", len(clouds)) as ctx:
+            for i in ctx:
+                ovn = clouds[i]
+                worker_count = len(ovn.worker_nodes)
+                for j in range(worker_count):
+                    worker_node: ChassisNode = ovn.worker_nodes[j]
+                    log.info(
+                        f"Provisioning {worker_node.__class__.__name__} "
+                        f"({j + 1}/{worker_count})"
+                    )
+                    worker_node.provision(ovn)
+
+        ovn = clouds[0]
+        batch_size = self.config.batch_size or self.config.n_projects
+        n_batches = (self.config.n_projects + batch_size - 1) // batch_size
+
+        ext_net = ExternalNetworkSpec(
+            neutron_net=ovn.new_external_network(),
+            num_gw_nodes=self.config.n_chassis_per_gw_lrp,
+        )
+
+        with Context(clouds, "bgp_batch", n_batches) as ctx:
+            for batch_idx in ctx:
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, self.config.n_projects)
+                nsenter = "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+
+                self.run_batch(ovn, nsenter, start_idx, end_idx, ext_net)
+
+                log.info(
+                    f"Batch {batch_idx + 1}/{n_batches}: "
+                    f"projects {start_idx + 1}-{end_idx} complete"
+                )

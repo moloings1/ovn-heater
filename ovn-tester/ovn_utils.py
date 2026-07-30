@@ -494,6 +494,13 @@ class OvnNbctl:
         log.info(f'Setting gw chassis {chassis} for router port {rp.name}')
         self.idl.lrp_set_gateway_chassis(rp.name, chassis, priority).execute()
 
+    def lr_port_set_options(self, rp: LRPort, options: Dict):
+        log.info(f'Setting options {options} for router port {rp.name}')
+        str_options = dict((k, str(v)) for k, v in options.items())
+        self.idl.db_set(
+            "Logical_Router_Port", rp.name, ("options", str_options)
+        ).execute()
+
     def ls_add(
         self,
         name: str,
@@ -846,6 +853,8 @@ class BaseOvnSbIdl(connection.OvsdbIdl):
         helper = idlutils.get_schema_helper(connection_string, cls.schema)
         helper.register_table('Chassis')
         helper.register_table('Connection')
+        helper.register_table('Learned_Route')
+        helper.register_table('Advertised_Route')
         return cls(connection_string, helper)
 
 
@@ -879,6 +888,9 @@ class OvnSbctl:
         cmd.execute()
         return len(cmd.result) == 1
 
+    def learned_routes(self) -> int:
+        cmd = self.idl.db_find_rows("Learned_Route")
+        return len(cmd.execute())
 
 class NBIcIdl(nb_ic_impl_idl.OvnIcNbApiIdlImpl, Backend):
     def __init__(self, connection):

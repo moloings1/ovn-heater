@@ -1,12 +1,12 @@
-internal-iface: eno1
+internal-iface: eno12399np0
 
 central-nodes:
-  - host02.mydomain.com
+  - 005-r760-ff58u10.anl.eng.rdu2.dc.redhat.com
 
 tester-node:
-  name: host02.mydoman.com
-  ssh_key: /path/to/ssh_key
+  name: 005-r760-ff58u10.anl.eng.rdu2.dc.redhat.com
+  ssh_key: /root/.ssh/id_ed25519
 
 worker-nodes:
-  - host03.mydomain.com
-  - host04.mydomain.com
+  - 005-r760-ff58u10.anl.eng.rdu2.dc.redhat.com
+  - 006-r760-ff58u12.anl.eng.rdu2.dc.redhat.com
