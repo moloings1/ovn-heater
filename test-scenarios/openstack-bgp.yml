@@ -12,4 +12,5 @@ base_bgp:
   n_chassis_per_gw_lrp: 3
   n_vms_per_project: 20
   n_routes_per_vrf: 100
+  n_advertised_routes: 100
   batch_size: 5

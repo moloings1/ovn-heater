@@ -8,6 +8,7 @@ from typing import List
 from ovn_ext_cmd import ExtCmd
 from ovn_context import Context
 from ovn_workload import ChassisNode
+from io import StringIO
 
 from cms.openstack import OpenStackCloud, ExternalNetworkSpec
 
@@ -20,6 +21,7 @@ class BaseBgpConfig:
     n_chassis_per_gw_lrp: int = 3
     n_vms_per_project: int = 10
     n_routes_per_vrf: int = 100
+    n_advertised_routes: int = 100
     batch_size: int = 0
 
 
@@ -45,6 +47,84 @@ class BaseBgp(ExtCmd):
                 return learned
             time.sleep(0.001)
 
+    def wait_for_vrf_routes(
+        self, chassis, nsenter, vrf_id, expected, timeout=300
+    ):
+        deadline = time.time() + timeout
+        while True:
+
+            stdout = StringIO()
+            chassis.run(
+                f"{nsenter} ip route show table {vrf_id}",
+                stdout=stdout,
+            )
+            count = len(stdout.getvalue().strip().splitlines())
+            log.info(f"VRF {vrf_id} routes: {count} vs expected {expected}")
+            if count >= expected:
+                return count
+            if time.time() > deadline:
+                log.warning(
+                    f"Timed out waiting for VRF routes: "
+                    f"{count}/{expected} after {timeout}s"
+                )
+                return count
+            time.sleep(1)
+
+    @ovn_stats.timeit
+    def run_batch_advertise(self, ovn, nsenter, start_idx, end_idx):
+        for vrf_id, project in enumerate(
+            ovn.projects[start_idx:end_idx], start=start_idx + 1
+        ):
+            if not project.gw_port:
+                continue
+
+            # Add static routes to the router via NB
+            for r in range(self.config.n_advertised_routes):
+                octet2 = (vrf_id >> 8) & 0xFF
+                octet3 = vrf_id & 0xFF
+                octet4 = r & 0xFF
+                dst = f"20.{octet2}.{octet3}.{octet4}/32"
+                gw = f"172.{octet2}.{octet3}.1"
+                ovn.nbctl.idl.lr_route_add(
+                    project.router.uuid, dst, gw
+                ).execute()
+
+            log.info(
+                f"Added {self.config.n_advertised_routes} NB routes "
+                f"to router {project.router.name}"
+            )
+
+        # Wait for routes to appear in each project's kernel VRF
+        for vrf_id, project in enumerate(
+            ovn.projects[start_idx:end_idx], start=start_idx + 1
+        ):
+            if not project.gw_port:
+                continue
+
+            vrf_dev = f"ovnvrf{vrf_id}"
+            hosting = None
+            for chassis in ovn.worker_nodes:
+                try:
+                    chassis.run(
+                        f"{nsenter} test -d /sys/class/net/{vrf_dev}",
+                        raise_on_error=True,
+                    )
+                    hosting = chassis
+                    break
+                except Exception:
+                    pass
+
+            if not hosting:
+                log.warning(f"{vrf_dev} not found on any chassis")
+                continue
+
+            self.wait_for_vrf_routes(
+                hosting,
+                nsenter,
+                vrf_id,
+                self.config.n_advertised_routes,
+            )
+
     @ovn_stats.timeit
     def run_batch(self, ovn, nsenter, start_idx, end_idx, ext_net):
         # Create projects and VMs for this batch
@@ -64,6 +144,7 @@ class BaseBgp(ExtCmd):
                 {
                     "dynamic-routing": "true",
                     "dynamic-routing-vrf-id": str(vrf_id),
+                    "dynamic-routing-redistribute": "static,connected",
                 },
             )
             if project.gw_port:
@@ -153,5 +234,18 @@ class BaseBgp(ExtCmd):
 
                 log.info(
                     f"Batch {batch_idx + 1}/{n_batches}: "
+                    f"projects {start_idx + 1}-{end_idx} complete"
+                )
+
+        with Context(clouds, "bgp_advertise", n_batches) as ctx:
+            for batch_idx in ctx:
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, self.config.n_projects)
+                nsenter = "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+
+                self.run_batch_advertise(ovn, nsenter, start_idx, end_idx)
+
+                log.info(
+                    f"Advertise batch {batch_idx + 1}/{n_batches}: "
                     f"projects {start_idx + 1}-{end_idx} complete"
                 )
