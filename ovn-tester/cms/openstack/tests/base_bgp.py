@@ -75,42 +75,14 @@ class BaseBgp(ExtCmd):
 
     @ovn_stats.timeit
     def run_batch_advertise(self, ovn, nsenter, start_idx, end_idx):
+        # Find VRF hosts and snapshot baseline route counts BEFORE adding
+        vrf_info = {}
         for vrf_id, project in enumerate(
             ovn.projects[start_idx:end_idx], start=start_idx + 1
         ):
             if not project.gw_port:
                 continue
-
-            for r in range(self.config.n_advertised_routes):
-                octet2 = (vrf_id >> 8) & 0xFF
-                octet3 = vrf_id & 0xFF
-                octet4 = r & 0xFF
-                dst = f"40.{octet2}.{octet3}.{octet4}/32"
-                gw = str(project.int_net.gateway)
-                ovn.nbctl.idl.lr_route_add(
-                    project.router.uuid, dst, gw
-                ).execute(check_error=True)
-
-            log.info(
-                f"Added {self.config.n_advertised_routes} NB routes "
-                f"to router {project.router.name}"
-            )
-            
-            stdout = StringIO()
-            ovn.worker_nodes[0].run(
-                f"ovn-nbctl lr-route-list {project.router.name}",
-                stdout=stdout,
-            )
-            nb_count = len(stdout.getvalue().strip().splitlines())
-            log.info(f"NB route count for {project.router.name}: {nb_count}")
-
-        # Wait for routes to appear in each project's kernel VRF
-        for vrf_id, project in enumerate(
-            ovn.projects[start_idx:end_idx], start=start_idx + 1
-        ):
-            if not project.gw_port:
-                continue
-
+    
             vrf_dev = f"ovnvrf{vrf_id}"
             vrf_hosts = []
             for chassis in ovn.worker_nodes:
@@ -122,16 +94,49 @@ class BaseBgp(ExtCmd):
                     vrf_hosts.append(chassis)
                 except Exception:
                     pass
-            
+    
             if not vrf_hosts:
                 log.warning(f"{vrf_dev} not found on any chassis")
                 continue
-            
+    
+            stdout = StringIO()
+            vrf_hosts[0].run(
+                f"ip route show vrf {vrf_dev} | cat",
+                stdout=stdout,
+            )
+            baseline = len(stdout.getvalue().strip().splitlines())
+            vrf_info[vrf_id] = (vrf_dev, vrf_hosts, baseline)
+            log.info(f"{vrf_dev} baseline: {baseline} routes")
+    
+        # Add static routes to NB
+        for vrf_id, project in enumerate(
+            ovn.projects[start_idx:end_idx], start=start_idx + 1
+        ):
+            if not project.gw_port:
+                continue
+    
+            for r in range(self.config.n_advertised_routes):
+                octet2 = (vrf_id >> 8) & 0xFF
+                octet3 = vrf_id & 0xFF
+                octet4 = r & 0xFF
+                dst = f"40.{octet2}.{octet3}.{octet4}/32"
+                gw = str(project.int_net.gateway)
+                ovn.nbctl.idl.lr_route_add(
+                    project.router.uuid, dst, gw
+                ).execute(check_error=True)
+    
+            log.info(
+                f"Added {self.config.n_advertised_routes} NB routes "
+                f"to router {project.router.name}"
+            )
+    
+        # Wait for advertised routes to appear
+        for vrf_id, (vrf_dev, vrf_hosts, baseline) in vrf_info.items():
             self.wait_for_vrf_routes(
                 vrf_hosts,
                 nsenter,
                 vrf_dev,
-                self.config.n_advertised_routes,
+                baseline + self.config.n_advertised_routes,
             )
 
     @ovn_stats.timeit
