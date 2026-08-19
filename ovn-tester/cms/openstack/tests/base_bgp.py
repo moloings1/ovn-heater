@@ -48,18 +48,18 @@ class BaseBgp(ExtCmd):
             time.sleep(0.001)
 
     def wait_for_vrf_routes(
-        self, chassis, nsenter, vrf_id, expected, timeout=300
+        self, chassis, nsenter, vrf_name, expected, timeout=300
     ):
         deadline = time.time() + timeout
         while True:
 
             stdout = StringIO()
             chassis.run(
-                f"{nsenter} ip route show table {vrf_id}",
+                f"{nsenter} ip route show vrf {vrf_name}",
                 stdout=stdout,
             )
             count = len(stdout.getvalue().strip().splitlines())
-            log.info(f"VRF {vrf_id} routes: {count} vs expected {expected}")
+            log.info(f"VRF {vrf_name} routes: {count} vs expected {expected}")
             if count >= expected:
                 return count
             if time.time() > deadline:
@@ -79,15 +79,26 @@ class BaseBgp(ExtCmd):
                 continue
 
             # Add static routes to the router via NB
+            #for r in range(self.config.n_advertised_routes):
+            #    octet2 = (vrf_id >> 8) & 0xFF
+            #    octet3 = vrf_id & 0xFF
+            #    octet4 = r & 0xFF
+            #    dst = f"20.{octet2}.{octet3}.{octet4}/32"
+            #    gw = f"172.{octet2}.{octet3}.1"
+            #    ovn.nbctl.idl.lr_route_add(
+            #        project.router.uuid, dst, gw
+            #    ).execute()
+
             for r in range(self.config.n_advertised_routes):
                 octet2 = (vrf_id >> 8) & 0xFF
                 octet3 = vrf_id & 0xFF
                 octet4 = r & 0xFF
-                dst = f"20.{octet2}.{octet3}.{octet4}/32"
-                gw = f"172.{octet2}.{octet3}.1"
+                dst = f"40.{octet2}.{octet3}.{octet4}/32"
+                gw = str(project.int_net.gateway)
                 ovn.nbctl.idl.lr_route_add(
                     project.router.uuid, dst, gw
                 ).execute()
+
 
             log.info(
                 f"Added {self.config.n_advertised_routes} NB routes "
@@ -121,7 +132,7 @@ class BaseBgp(ExtCmd):
             self.wait_for_vrf_routes(
                 hosting,
                 nsenter,
-                vrf_id,
+                vrf_dev,
                 self.config.n_advertised_routes,
             )
 
