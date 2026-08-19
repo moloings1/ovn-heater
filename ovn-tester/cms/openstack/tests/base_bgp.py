@@ -48,26 +48,29 @@ class BaseBgp(ExtCmd):
             time.sleep(0.001)
 
     def wait_for_vrf_routes(
-        self, chassis, nsenter, vrf_name, expected, timeout=300
+        self, chassis_list, nsenter, vrf_name, expected, timeout=300
     ):
         deadline = time.time() + timeout
         while True:
-
-            stdout = StringIO()
-            chassis.run(
-                f"{nsenter} ip route show vrf {vrf_name}",
-                stdout=stdout,
-            )
-            count = len(stdout.getvalue().strip().splitlines())
-            log.info(f"VRF {vrf_name} routes: {count} vs expected {expected}")
-            if count >= expected:
-                return count
+            max_count = 0
+            for chassis in chassis_list:
+                stdout = StringIO()
+                chassis.run(
+                    f"ip route show vrf {vrf_name} | cat",
+                    stdout=stdout,
+                )
+                count = len(stdout.getvalue().strip().splitlines())
+                max_count = max(max_count, count)
+    
+            log.info(f"VRF {vrf_name} routes: {max_count} vs expected {expected}")
+            if max_count >= expected:
+                return max_count
             if time.time() > deadline:
                 log.warning(
                     f"Timed out waiting for VRF routes: "
-                    f"{count}/{expected} after {timeout}s"
+                    f"{max_count}/{expected} after {timeout}s"
                 )
-                return count
+                return max_count
             time.sleep(1)
 
     @ovn_stats.timeit
@@ -78,17 +81,6 @@ class BaseBgp(ExtCmd):
             if not project.gw_port:
                 continue
 
-            # Add static routes to the router via NB
-            #for r in range(self.config.n_advertised_routes):
-            #    octet2 = (vrf_id >> 8) & 0xFF
-            #    octet3 = vrf_id & 0xFF
-            #    octet4 = r & 0xFF
-            #    dst = f"20.{octet2}.{octet3}.{octet4}/32"
-            #    gw = f"172.{octet2}.{octet3}.1"
-            #    ovn.nbctl.idl.lr_route_add(
-            #        project.router.uuid, dst, gw
-            #    ).execute()
-
             for r in range(self.config.n_advertised_routes):
                 octet2 = (vrf_id >> 8) & 0xFF
                 octet3 = vrf_id & 0xFF
@@ -97,13 +89,20 @@ class BaseBgp(ExtCmd):
                 gw = str(project.int_net.gateway)
                 ovn.nbctl.idl.lr_route_add(
                     project.router.uuid, dst, gw
-                ).execute()
-
+                ).execute(check_error=True)
 
             log.info(
                 f"Added {self.config.n_advertised_routes} NB routes "
                 f"to router {project.router.name}"
             )
+            
+            stdout = StringIO()
+            ovn.worker_nodes[0].run(
+                f"ovn-nbctl lr-route-list {project.router.name}",
+                stdout=stdout,
+            )
+            nb_count = len(stdout.getvalue().strip().splitlines())
+            log.info(f"NB route count for {project.router.name}: {nb_count}")
 
         # Wait for routes to appear in each project's kernel VRF
         for vrf_id, project in enumerate(
@@ -113,24 +112,23 @@ class BaseBgp(ExtCmd):
                 continue
 
             vrf_dev = f"ovnvrf{vrf_id}"
-            hosting = None
+            vrf_hosts = []
             for chassis in ovn.worker_nodes:
                 try:
                     chassis.run(
-                        f"{nsenter} test -d /sys/class/net/{vrf_dev}",
+                        f"test -d /sys/class/net/{vrf_dev}",
                         raise_on_error=True,
                     )
-                    hosting = chassis
-                    break
+                    vrf_hosts.append(chassis)
                 except Exception:
                     pass
-
-            if not hosting:
+            
+            if not vrf_hosts:
                 log.warning(f"{vrf_dev} not found on any chassis")
                 continue
-
+            
             self.wait_for_vrf_routes(
-                hosting,
+                vrf_hosts,
                 nsenter,
                 vrf_dev,
                 self.config.n_advertised_routes,
