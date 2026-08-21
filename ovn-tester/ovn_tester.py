@@ -44,13 +44,20 @@ def read_physical_deployment(
         dep = yaml.safe_load(yaml_file)
 
         central_nodes = [
-            PhysicalNode(central, global_cfg.log_cmds)
-            for central in dep['central-nodes']
+            PhysicalNode(
+                list(c.keys())[0] if isinstance(c, dict) else c,
+                global_cfg.log_cmds,
+            )
+            for c in dep['central-nodes']
         ]
         worker_nodes = [
-            PhysicalNode(worker, global_cfg.log_cmds)
-            for worker in dep['worker-nodes']
+            PhysicalNode(
+                list(w.keys())[0] if isinstance(w, dict) else w,
+                global_cfg.log_cmds,
+            )
+            for w in dep['worker-nodes']
         ]
+
         return central_nodes, worker_nodes
 
 

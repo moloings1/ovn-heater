@@ -104,6 +104,35 @@
       chdir: "{{ ovn_fake_multinode_target_path }}/ovn-fake-multinode"
     loop: "{{ range(groups['worker_hosts'].index(inventory_hostname),
                     n_workers|int, groups['worker_hosts']|length) | list }}"
+# TODO: Remove pyroute install once ovn-fake-multinode CI is fixed
+- name: Install pyroute2 in worker containers
+  hosts: worker_hosts
+  tasks:
+    - name: Enumerate worker containers
+      ansible.builtin.shell: |
+        podman ps --filter='name={{ node_name }}-' \
+                  --noheading --format={{ '{{.Names}}' }}
+      register: containers
+    - name: Install pyroute2
+      ansible.builtin.shell: |
+        podman exec {{ item }} bash -c "
+          pip3 install --break-system-packages pyroute2
+        "
+      loop: "{{ containers.stdout_lines }}"
+
+- name: Copy inject_routes script to worker containers
+  hosts: worker_hosts
+  tasks:
+  - name: Enumerate worker containers
+    ansible.builtin.shell: |
+      podman ps --filter='name={{ node_name }}-' \
+                --noheading --format={{ '{{.Names}}' }}
+    register: containers
+
+  - name: Copy script to containers
+    ansible.builtin.shell: |
+      podman cp /tmp/ovn_inject_routes.py {{ item }}:/tmp/
+    loop: "{{ containers.stdout_lines }}"
 
 
 - name: Start process monitoring
