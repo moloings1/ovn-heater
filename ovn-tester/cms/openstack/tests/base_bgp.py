@@ -1,6 +1,7 @@
 import logging
 import time
 import ovn_stats
+import ipaddress
 
 from dataclasses import dataclass
 from typing import List
@@ -88,6 +89,26 @@ class BaseBgp(ExtCmd):
                 return max_count
             time.sleep(1)
 
+    def find_vrf_host(self, ovn, nsenter, vrf_dev, timeout=30):
+        """Find which chassis is hosting the given VRF device.
+
+        Returns:
+            The hosting chassis, or None if not found within timeout.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for chassis in ovn.worker_nodes:
+                try:
+                    chassis.run(
+                        f"{nsenter} test -d /sys/class/net/{vrf_dev}",
+                        raise_on_error=True,
+                    )
+                    return chassis
+                except Exception:
+                    pass
+            time.sleep(1)
+        return None
+
     @ovn_stats.timeit
     def run_batch_advertise(self, ovn, start_idx, end_idx):
         # Find VRF hosts and snapshot baseline route counts BEFORE adding.
@@ -130,7 +151,7 @@ class BaseBgp(ExtCmd):
             if not project.gw_port:
                 continue
 
-            base_ip = netaddr.IPAddress((40 << 24) | (vrf_id << 8))
+            base_ip = ipaddress.IPv4Address((40 << 24) | (vrf_id << 8))
 
             for r in range(self.config.n_advertised_routes):
                 dst = f"{base_ip + r}/32"
@@ -195,26 +216,11 @@ class BaseBgp(ExtCmd):
                 continue
 
             vrf_dev = f"ovnvrf{vrf_id}"
-            octet2 = (vrf_id >> 8) & 0xFF
-            octet3 = vrf_id & 0xFF
-            nexthop = f"172.{octet2}.{octet3}.1"
+            nexthop = str(
+                ipaddress.IPv4Address((172 << 24) | (vrf_id << 8) | 1)
+            )
 
-            hosting = None
-            for attempt in range(30):
-                for chassis in ovn.worker_nodes:
-                    try:
-                        chassis.run(
-                            f"{nsenter} test -d /sys/class/net/{vrf_dev}",
-                            raise_on_error=True,
-                        )
-                        hosting = chassis
-                        break
-                    except Exception:
-                        pass
-                if hosting:
-                    break
-                time.sleep(1)
-
+            hosting = self.find_vrf_host(ovn, nsenter, vrf_dev, timeout=30)
             if not hosting:
                 log.warning(f"{vrf_dev} not found on any chassis")
                 continue
@@ -226,7 +232,11 @@ class BaseBgp(ExtCmd):
             )
 
         # Wait for cumulative learned routes.
-        expected = end_idx * self.config.n_routes_per_vrf
+        # Count only projects that actually had routes injected (have gw_port).
+        injected_count = sum(
+            1 for project in ovn.projects[start_idx:end_idx] if project.gw_port
+        )
+        expected = injected_count * self.config.n_routes_per_vrf
         self.wait_for_learned_routes(
             ovn, expected, timeout=self.config.route_timeout_s
         )
@@ -245,37 +255,54 @@ class BaseBgp(ExtCmd):
                     )
                     worker_node.provision(ovn)
 
-        ovn = clouds[0]
-        batch_size = self.config.batch_size or self.config.n_projects
-        n_batches = (self.config.n_projects + batch_size - 1) // batch_size
+        # Test BGP on all clouds.
+        for cloud_idx, ovn in enumerate(clouds):
+            batch_size = self.config.batch_size or self.config.n_projects
+            n_batches = (self.config.n_projects + batch_size - 1) // batch_size
 
-        ext_net = ExternalNetworkSpec(
-            neutron_net=ovn.new_external_network(),
-            num_gw_nodes=self.config.n_chassis_per_gw_lrp,
-        )
+            ext_net = ExternalNetworkSpec(
+                neutron_net=ovn.new_external_network(),
+                num_gw_nodes=self.config.n_chassis_per_gw_lrp,
+            )
 
-        with Context(clouds, "bgp_batch", n_batches) as ctx:
-            for batch_idx in ctx:
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, self.config.n_projects)
-                nsenter = "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+            with Context(
+                [ovn], f"bgp_batch_cloud_{cloud_idx}", n_batches
+            ) as ctx:
+                for batch_idx in ctx:
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(
+                        start_idx + batch_size, self.config.n_projects
+                    )
+                    nsenter = (
+                        "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+                    )
 
-                self.run_batch_learn(ovn, nsenter, start_idx, end_idx, ext_net)
+                    self.run_batch_learn(
+                        ovn, nsenter, start_idx, end_idx, ext_net
+                    )
 
-                log.info(
-                    f"Batch {batch_idx + 1}/{n_batches}: "
-                    f"projects {start_idx + 1}-{end_idx} complete"
-                )
+                    log.info(
+                        f"Cloud {cloud_idx} batch "
+                        f"{batch_idx + 1}/{n_batches}: "
+                        f"projects {start_idx + 1}-{end_idx} complete"
+                    )
 
-        with Context(clouds, "bgp_advertise", n_batches) as ctx:
-            for batch_idx in ctx:
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, self.config.n_projects)
-                nsenter = "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+            with Context(
+                [ovn], f"bgp_advertise_cloud_{cloud_idx}", n_batches
+            ) as ctx:
+                for batch_idx in ctx:
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(
+                        start_idx + batch_size, self.config.n_projects
+                    )
+                    nsenter = (
+                        "nsenter -t $(cat /run/ovn/ovn-controller.pid) -n"
+                    )
 
-                self.run_batch_advertise(ovn, start_idx, end_idx)
+                    self.run_batch_advertise(ovn, start_idx, end_idx)
 
-                log.info(
-                    f"Advertise batch {batch_idx + 1}/{n_batches}: "
-                    f"projects {start_idx + 1}-{end_idx} complete"
-                )
+                    log.info(
+                        f"Cloud {cloud_idx} advertise batch "
+                        f"{batch_idx + 1}/{n_batches}: "
+                        f"projects {start_idx + 1}-{end_idx} complete"
+                    )
