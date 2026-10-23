@@ -34,12 +34,29 @@ class BaseBgp(ExtCmd):
         test_config = config.get("base_bgp")
         self.config = BaseBgpConfig(**test_config)
 
-    def inject_vrf_routes(self, hosting, nsenter, vrf_dev, nexthop, vrf_id):
+    @staticmethod
+    def vrf_nexthop(vrf_id):
+        return str(ipaddress.IPv4Address((172 << 24) | (vrf_id << 8) | 1))
+
+    @staticmethod
+    def vrf_route_base(vrf_id):
+        """Base of the range the bulk routes of a VRF are injected into."""
+        return ipaddress.IPv4Address((10 << 24) | (vrf_id << 8))
+
+    @staticmethod
+    def vrf_probe_route(vrf_id, attempt):
+        """Probe route of a VRF, outside the range of its bulk routes."""
+        return ipaddress.IPv4Address(
+            (10 << 24) | (255 << 16) | (vrf_id << 8) | attempt
+        )
+
+    def inject_vrf_routes(
+        self, hosting, nsenter, vrf_dev, vrf_id, base, n_routes
+    ):
         hosting.run(
             f"{nsenter} python3 /tmp/ovn_inject_routes.py "
-            f"--vrf-dev {vrf_dev} --nexthop {nexthop} "
-            f"--table {vrf_id} --n-routes {self.config.n_routes_per_vrf} "
-            f"--vrf-id {vrf_id}",
+            f"--vrf-dev {vrf_dev} --nexthop {self.vrf_nexthop(vrf_id)} "
+            f"--table {vrf_id} --n-routes {n_routes} --base {base}",
             raise_on_error=True,
         )
 
@@ -108,6 +125,55 @@ class BaseBgp(ExtCmd):
                     pass
             time.sleep(1)
         return None
+
+    def wait_for_route_exchange(self, ovn, hosting, nsenter, vrf_dev, vrf_id):
+        """Wait until ovn-controller actually learns from a VRF's table.
+
+        ovn-controller creates the VRF device before it dumps the table and
+        before it starts watching it for changes, so a route injected right
+        after the device appears can be missed by the dump and then dropped
+        by the notifier.  Nothing re-reads the table afterwards, so those
+        routes are never learned.
+
+        Inject one probe route at a time until one of them shows up in the
+        SB, which proves this table is being watched.  Each attempt uses a
+        fresh prefix, because re-adding an existing route does not generate
+        a netlink notification.  The probe must be looked up by its own
+        prefix: a global row count also moves when another VRF's routes
+        land, which would declare this one live while its table is still
+        unwatched.
+        """
+        deadline = time.time() + self.config.route_timeout_s
+        attempt = 0
+        while True:
+            # OVN normalizes a host route to a bare address, without the
+            # "/32" the prefix would otherwise carry.
+            probe = str(self.vrf_probe_route(vrf_id, attempt))
+            self.inject_vrf_routes(
+                hosting,
+                nsenter,
+                vrf_dev,
+                vrf_id,
+                self.vrf_probe_route(vrf_id, attempt),
+                1,
+            )
+
+            probe_deadline = min(time.time() + 2, deadline)
+            while time.time() < probe_deadline:
+                if ovn.sbctl.learned_route_exists(probe):
+                    log.info(
+                        f"{vrf_dev} route exchange live after "
+                        f"{attempt + 1} probe(s)"
+                    )
+                    return
+                time.sleep(0.1)
+
+            attempt += 1
+            if time.time() > deadline or attempt > 255:
+                raise ovn_exceptions.OvnRouteTimeoutException(
+                    f"{vrf_dev} routes not learned after {attempt} probes "
+                    f"in {self.config.route_timeout_s}s"
+                )
 
     @ovn_stats.timeit
     def run_batch_advertise(self, ovn, start_idx, end_idx):
@@ -211,7 +277,10 @@ class BaseBgp(ExtCmd):
 
     @ovn_stats.timeit
     def run_batch_vrf_setup(self, ovn, nsenter, start_idx, end_idx):
-        """Wait for ovn-controller to create this batch's VRF devices.
+        """Make this batch's VRFs ready to measure route learning on.
+
+        Waits for ovn-controller to create each VRF device and to start
+        learning from its table.
 
         Returns:
             Dict of vrf_id -> (vrf_dev, hosting chassis).
@@ -232,6 +301,10 @@ class BaseBgp(ExtCmd):
                     f"{vrf_dev} not created on any chassis after "
                     f"{self.config.route_timeout_s}s"
                 )
+
+            self.wait_for_route_exchange(
+                ovn, hosting, nsenter, vrf_dev, vrf_id
+            )
             vrf_hosts[vrf_id] = (vrf_dev, hosting)
 
         return vrf_hosts
@@ -243,11 +316,14 @@ class BaseBgp(ExtCmd):
         baseline = ovn.sbctl.learned_routes()
 
         for vrf_id, (vrf_dev, hosting) in vrf_hosts.items():
-            nexthop = str(
-                ipaddress.IPv4Address((172 << 24) | (vrf_id << 8) | 1)
+            self.inject_vrf_routes(
+                hosting,
+                nsenter,
+                vrf_dev,
+                vrf_id,
+                self.vrf_route_base(vrf_id),
+                self.config.n_routes_per_vrf,
             )
-
-            self.inject_vrf_routes(hosting, nsenter, vrf_dev, nexthop, vrf_id)
             log.info(
                 f"Injected {self.config.n_routes_per_vrf} routes "
                 f"into {vrf_dev} on {hosting.container}"
