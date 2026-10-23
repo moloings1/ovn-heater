@@ -106,27 +106,35 @@ class BaseBgp(ExtCmd):
                 )
             time.sleep(1)
 
-    def find_vrf_host(self, ovn, nsenter, vrf_dev, timeout=30):
-        """Find which chassis is hosting the given VRF device.
+    def find_vrf_hosts(self, ovn, nsenter, vrf_dev, timeout=30):
+        """Find every chassis hosting the given VRF device.
+
+        ovn-controller maintains the VRF on each chassis the router port
+        is a gateway candidate for, not only the active one, and any of
+        them may be the one that syncs the table to the SB.  A routing
+        daemon would populate the VRF on all of them, so the test has to
+        as well.
 
         Returns:
-            The hosting chassis, or None if not found within timeout.
+            The list of hosting chassis, empty if none within timeout.
         """
         deadline = time.time() + timeout
-        while time.time() < deadline:
+        while True:
+            hosts = []
             for chassis in ovn.worker_nodes:
                 try:
                     chassis.run(
                         f"{nsenter} test -d /sys/class/net/{vrf_dev}",
                         raise_on_error=True,
                     )
-                    return chassis
+                    hosts.append(chassis)
                 except Exception:
                     pass
+            if hosts or time.time() > deadline:
+                return hosts
             time.sleep(1)
-        return None
 
-    def wait_for_route_exchange(self, ovn, hosting, nsenter, vrf_dev, vrf_id):
+    def wait_for_route_exchange(self, ovn, hosts, nsenter, vrf_dev, vrf_id):
         """Wait until ovn-controller actually learns from a VRF's table.
 
         ovn-controller creates the VRF device before it dumps the table and
@@ -149,14 +157,15 @@ class BaseBgp(ExtCmd):
             # OVN normalizes a host route to a bare address, without the
             # "/32" the prefix would otherwise carry.
             probe = str(self.vrf_probe_route(vrf_id, attempt))
-            self.inject_vrf_routes(
-                hosting,
-                nsenter,
-                vrf_dev,
-                vrf_id,
-                self.vrf_probe_route(vrf_id, attempt),
-                1,
-            )
+            for hosting in hosts:
+                self.inject_vrf_routes(
+                    hosting,
+                    nsenter,
+                    vrf_dev,
+                    vrf_id,
+                    self.vrf_probe_route(vrf_id, attempt),
+                    1,
+                )
 
             probe_deadline = min(time.time() + 2, deadline)
             while time.time() < probe_deadline:
@@ -283,7 +292,7 @@ class BaseBgp(ExtCmd):
         learning from its table.
 
         Returns:
-            Dict of vrf_id -> (vrf_dev, hosting chassis).
+            Dict of vrf_id -> (vrf_dev, list of hosting chassis).
         """
         vrf_hosts = {}
         for vrf_id, project in enumerate(
@@ -293,19 +302,21 @@ class BaseBgp(ExtCmd):
                 continue
 
             vrf_dev = f"ovnvrf{vrf_id}"
-            hosting = self.find_vrf_host(
+            hosts = self.find_vrf_hosts(
                 ovn, nsenter, vrf_dev, timeout=self.config.route_timeout_s
             )
-            if not hosting:
+            if not hosts:
                 raise ovn_exceptions.OvnRouteTimeoutException(
                     f"{vrf_dev} not created on any chassis after "
                     f"{self.config.route_timeout_s}s"
                 )
-
-            self.wait_for_route_exchange(
-                ovn, hosting, nsenter, vrf_dev, vrf_id
+            log.info(
+                f"{vrf_dev} hosted on "
+                f"{', '.join(c.container for c in hosts)}"
             )
-            vrf_hosts[vrf_id] = (vrf_dev, hosting)
+
+            self.wait_for_route_exchange(ovn, hosts, nsenter, vrf_dev, vrf_id)
+            vrf_hosts[vrf_id] = (vrf_dev, hosts)
 
         return vrf_hosts
 
@@ -315,18 +326,19 @@ class BaseBgp(ExtCmd):
         # target is relative to what is already there.
         baseline = ovn.sbctl.learned_routes()
 
-        for vrf_id, (vrf_dev, hosting) in vrf_hosts.items():
-            self.inject_vrf_routes(
-                hosting,
-                nsenter,
-                vrf_dev,
-                vrf_id,
-                self.vrf_route_base(vrf_id),
-                self.config.n_routes_per_vrf,
-            )
+        for vrf_id, (vrf_dev, hosts) in vrf_hosts.items():
+            for hosting in hosts:
+                self.inject_vrf_routes(
+                    hosting,
+                    nsenter,
+                    vrf_dev,
+                    vrf_id,
+                    self.vrf_route_base(vrf_id),
+                    self.config.n_routes_per_vrf,
+                )
             log.info(
-                f"Injected {self.config.n_routes_per_vrf} routes "
-                f"into {vrf_dev} on {hosting.container}"
+                f"Injected {self.config.n_routes_per_vrf} routes into "
+                f"{vrf_dev} on {', '.join(c.container for c in hosts)}"
             )
 
         expected = baseline + len(vrf_hosts) * self.config.n_routes_per_vrf
