@@ -113,11 +113,16 @@ class BaseBgp(ExtCmd):
         is a gateway candidate for, not only the active one, and any of
         them may be the one that syncs the table to the SB.  A routing
         daemon would populate the VRF on all of them, so the test has to
-        as well.
+        as well.  Missing even one is not harmless: that chassis syncs an
+        empty table and deletes the routes the others learned.
+
+        The chassis create the device independently, so wait for all of
+        them rather than for the first.
 
         Returns:
             The list of hosting chassis, empty if none within timeout.
         """
+        expected = min(self.config.n_chassis_per_gw_lrp, len(ovn.worker_nodes))
         deadline = time.time() + timeout
         while True:
             hosts = []
@@ -130,7 +135,13 @@ class BaseBgp(ExtCmd):
                     hosts.append(chassis)
                 except Exception:
                     pass
-            if hosts or time.time() > deadline:
+            if len(hosts) >= expected:
+                return hosts
+            if time.time() > deadline:
+                log.warning(
+                    f"{vrf_dev} found on {len(hosts)}/{expected} chassis "
+                    f"after {timeout}s"
+                )
                 return hosts
             time.sleep(1)
 
