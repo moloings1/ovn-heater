@@ -106,8 +106,8 @@ class BaseBgp(ExtCmd):
                 )
             time.sleep(1)
 
-    def find_vrf_hosts(self, ovn, nsenter, vrf_dev, timeout=30):
-        """Find every chassis hosting the given VRF device.
+    def find_vrf_hosts(self, candidates, nsenter, vrf_dev, timeout=30):
+        """Wait for the VRF device on every chassis that should host it.
 
         ovn-controller maintains the VRF on each chassis the router port
         is a gateway candidate for, not only the active one, and any of
@@ -117,16 +117,19 @@ class BaseBgp(ExtCmd):
         empty table and deletes the routes the others learned.
 
         The chassis create the device independently, so wait for all of
-        them rather than for the first.
+        them rather than for the first.  'candidates' are the project's
+        gateway chassis, which is why this does not have to probe the
+        whole cluster: that costs one ssh round trip per worker per
+        sweep, which dominates the test once the cluster is large.
 
         Returns:
             The list of hosting chassis, empty if none within timeout.
         """
-        expected = min(self.config.n_chassis_per_gw_lrp, len(ovn.worker_nodes))
+        expected = len(candidates)
         deadline = time.time() + timeout
         while True:
             hosts = []
-            for chassis in ovn.worker_nodes:
+            for chassis in candidates:
                 try:
                     chassis.run(
                         f"{nsenter} test -d /sys/class/net/{vrf_dev}",
@@ -143,7 +146,9 @@ class BaseBgp(ExtCmd):
                     f"after {timeout}s"
                 )
                 return hosts
-            time.sleep(1)
+            # The devices normally appear within a few hundred ms, so a
+            # coarse retry would be most of this step's cost.
+            time.sleep(0.1)
 
     def wait_for_route_exchange(self, ovn, hosts, nsenter, vrf_dev, vrf_id):
         """Wait until ovn-controller actually learns from a VRF's table.
@@ -207,7 +212,7 @@ class BaseBgp(ExtCmd):
 
             vrf_dev = f"ovnvrf{vrf_id}"
             vrf_hosts = []
-            for chassis in ovn.worker_nodes:
+            for chassis in project.gw_chassis:
                 try:
                     chassis.run(
                         f"test -d /sys/class/net/{vrf_dev}",
@@ -314,7 +319,10 @@ class BaseBgp(ExtCmd):
 
             vrf_dev = f"ovnvrf{vrf_id}"
             hosts = self.find_vrf_hosts(
-                ovn, nsenter, vrf_dev, timeout=self.config.route_timeout_s
+                project.gw_chassis,
+                nsenter,
+                vrf_dev,
+                timeout=self.config.route_timeout_s,
             )
             if not hosts:
                 raise ovn_exceptions.OvnRouteTimeoutException(
